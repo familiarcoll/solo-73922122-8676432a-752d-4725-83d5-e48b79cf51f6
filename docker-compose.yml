@@ -1,13 +1,15 @@
 services:
-  perm-diag:
+  mail-preview:
     build: .
-    image: perm-diag:latest
-    container_name: perm-diag
+    image: mail-preview:latest
+    container_name: mail-preview
     ports:
       - "8000:8000"
     restart: unless-stopped
-    # 不挂载任何宿主卷：诊断完全基于浏览器提交的 JSON 快照
+    # 不挂载任何宿主卷：上传内容与重编码图片只存在进程内存
     read_only: true
+    tmpfs:
+      - /tmp:size=16m
     security_opt:
       - no-new-privileges:true
     cap_drop:

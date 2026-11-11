@@ -1,127 +1,119 @@
-# 共享文件服务器读取权限 · 离线诊断台
+# 钓鱼邮件 · 安全预览台
 
-运维排查「文件有读权限却打不开」时，用本工具在浏览器里编辑 **目录快照 JSON** 和 **读取请求 JSON**，
-由 FastAPI 后端按 Linux 无特权进程规则完整模拟路径解析（namei）与 DAC / POSIX ACL 判定，
-输出：能否读取、首个失败原因与分类、逐步解析过程、每一步实际采用的权限项。
+安全分析员查看被举报的钓鱼邮件时，需要看清 HTML 正文，又不能触发邮件里的脚本、
+远程跟踪像素或任何跳转。本服务接收浏览器上传的 `.eml`，在**受控解析 + 白名单清理 +
+浏览器隔离**三重防护下渲染正文：不执行邮件代码、不加载外部资源、不访问父页面。
 
-**全程只在内存中计算，不读取、不探测宿主机上的任何文件或路径**；容器以非 root、只读根文件系统、
-丢弃全部 Linux capability 的方式运行，也不挂载宿主目录。
+## 一、能力与约束
 
-## 一、启动
+| 维度 | 规则 |
+| --- | --- |
+| 上传大小 | 最大 **1 MiB**，超限在读取阶段即拒绝（413） |
+| 邮件结构 | 仅接受顶层 **multipart/related**，最多 **20 个 MIME 部分** |
+| 正文 | 必须**恰好一份** `text/html`，且为严格 **UTF-8**（非法字节拒绝） |
+| 嵌套 | 嵌套 multipart、`message/*` 嵌套文档一律拒绝 |
+| 图片 | 仅接受带 `Content-ID` 的 **PNG/JPEG**；重复 Content-ID 拒绝 |
+| 图片处理 | Pillow **实际解码后重新编码**输出，原始字节不直接下发；损坏/伪装/超像素→占位图 |
+| 外部资源 | `http(s)`、`data:`、`//host` 等非 `cid:` 图片一律替换为服务端占位图 |
+| 缺失 cid | 正文引用了邮件中不存在的 cid → 占位图 |
+| 危险内容 | 剥离 `script/style/form/iframe/object/svg/meta/base/link` 等及整棵子树、全部 `on*` 事件、`style/class/id` 属性 |
+| 链接 | `<a>` 降级为不可点击的 `<span>`，只展示**链接文字与原始地址**；`javascript:` 等不展示为地址 |
+| 排版 | 保留段落、标题、强调、列表、表格、引用、预格式化等白名单结构 |
+
+## 二、纵深防御（任意单层独立成立）
+
+1. **结构层**（`app/eml_parser.py`）：白名单 MIME 类型、严格 UTF-8、cid 唯一性、
+   部分数量与嵌套约束，输入不合法直接拒绝且**不创建任何预览**。
+2. **内容层**（`app/sanitizer.py`）：基于标准库 `html.parser` 的**默认拒绝**白名单清理器。
+   未显式允许的标签/属性没有任何保留路径；图片 `src` 被强制改写为同源预览 URL。
+3. **浏览器隔离层**（响应头）：
+   - 预览文档 `Content-Security-Policy: default-src 'none'; img-src 'self';
+     style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'self'; base-uri 'none'`；
+   - 图片响应 `default-src 'none'; frame-ancestors 'none'` + `X-Content-Type-Options: nosniff`；
+   - 首页以无令牌 `sandbox=""` 的 iframe 嵌入预览（无脚本、无弹窗、无表单、无同源访问）。
+
+**直接打开预览 URL 或图片 URL 同样安全**：隔离来自响应头与清理后的文档本身，
+不依赖外层 iframe。
+
+4. **数据隔离**：每次上传生成不可猜测的随机预览 ID，图片按 `(预览ID, 随机key)` 作用域存储。
+   两封邮件即使使用**相同 Content-ID 也不会串图**；跨预览取图返回 404。
+   预览仅存进程内存（容器根文件系统只读），带 30 分钟 TTL 与 64 份容量上限（LRU 淘汰），
+   重启即清空。
+
+## 三、启动
 
 ### 方式 A：Docker Compose（推荐，可实际演示）
 
 ```bash
 docker compose up --build
-# 浏览器打开
-#   http://localhost:8000/
+# 浏览器打开 http://localhost:8000/
 ```
 
-页面即诊断入口：左侧选择/编辑示例 JSON，右侧展示结论与逐步解析。
+容器以非 root（uid 10001）、只读根文件系统、`no-new-privileges`、丢弃全部 Linux
+capability 运行，不挂载任何宿主目录。单 uvicorn worker + 多线程，保证内存预览一致。
 
 ### 方式 B：本机 Python（3.11+）
 
 ```bash
-python3 -m pip install -r requirements.txt   # 离线环境请提前准备 wheelhouse
-./run.sh                                      # 等价于 uvicorn app.main:app --port 8000
+python3 -m pip install -r requirements.txt
+./run.sh                         # 等价 uvicorn app.main:app --workers 1
 # 打开 http://localhost:8000/
 ```
 
-健康检查：`GET /health`；OpenAPI 文档：`GET /docs`。
-
-## 二、快照与请求格式
-
-### 快照 snapshot（最多 100 个节点）
-
-```json
-{
-  "users":  {"1001": "alice"},
-  "groups": {"1000": "staff"},
-  "nodes": [
-    {
-      "path": "/srv/secret.txt",          // 必须绝对、规范化、唯一
-      "type": "file",                     // file | directory | symlink | other
-      "uid": 0, "gid": 0,
-      "mode": "640",                      // 3~4 位八进制字符串，也接受整数
-      "link_target": "../etc/x",          // 仅 symlink 需要
-      "acl": [                             // 可选，POSIX.1e 访问 ACL
-        {"type": "user_obj",  "perms": "rw-"},
-        {"type": "user",      "qualifier": 1001, "perms": "rwx"},
-        {"type": "group_obj", "perms": "r--"},
-        {"type": "group",     "qualifier": 1000, "perms": "r-x"},
-        {"type": "mask",      "perms": "r--"},
-        {"type": "other",     "perms": "---"}
-      ]
-    }
-  ]
-}
-```
-
-- `perms` 接受 `"rwx"` 三元组（无权限位写 `-`）或整数 `0..7`；
-- 含命名 `user`/`group` 条目（扩展 ACL）时**必须**带 `mask`，否则快照校验报错；
-- 必须包含根目录 `/` 且类型为 `directory`；
-- 校验错误会返回精确定位，例如 `$['nodes']['2']['mode']`。
-
-### 请求 request
-
-```json
-{ "uid": 1001, "gid": 1001, "supp_groups": [100, 1000], "path": "/srv/secret.txt" }
-```
-
-- `uid` 必须是**非 0 正整数**（root 拥有 cap_dac_override，不适用本诊断）；
-- `path` 必须是绝对路径，允许包含 `.`、`..` 与软链接，按 Linux 规则物理解析。
-
-## 三、判定语义（与 Linux 对齐）
-
-1. **逐级搜索权限**：进入/使用每个目录前检查其 `--x`；`EACCES` 优先于 `ENOENT`
-   （目录不可搜索时，即使目标不存在也先报权限不足）。
-2. **软链接**：相对目标按链接所在目录展开，绝对目标从 `/` 重新展开；
-   链接自身的 mode 不参与判定；最多跟随 **40** 次（`MAXSYMLINKS`），第 41 次报 `ELOOP`。
-3. **不提前折叠 `..`**：`..` 回退到当前物理目录的父目录——经过软链接后，
-   结果与字符串规范化不同（见内置示例 3）。
-4. **经典 mode**：属主 → 组（主组或任一附加组命中即用组位）→ other。
-5. **POSIX ACL**：
-   - 属主永远使用 `user_obj`（命名 user 条目不匹配属主自身）；
-   - 命名 `user` 命中即终局，权限受 `mask` 约束，**不退回** group/other；
-   - 所有命中的组条目（含 `group_obj` 与命名 `group`）权限取**并集**后再与 `mask`；
-     只要组身份命中就**不退回** other；
-   - 属主与所有组条目均未命中身份时才使用 `other`。
-6. **结果分类**：`permission_denied`（EACCES）、`path_missing`（ENOENT）、
-   `link_limit_exceeded`（ELOOP）、`not_regular`（最终节点非普通文件 / 中间组件 ENOTDIR）、`ok`。
-
-> 说明：本工具模拟普通文件的 `open(O_RDONLY)` 判定，不覆盖 sticky bit 删除规则、
-> setuid/setgid、capabilities 与挂载选项（nosuid/nodev 等）——这些不影响无特权进程的读授权结论。
+健康检查：`GET /health`；约束查询：`GET /api/limits`；样例清单：`GET /api/samples`。
 
 ## 四、HTTP API
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET  | `/` | 浏览器诊断页面（单文件、零外部依赖，可离线） |
+| GET  | `/` | 上传页（单文件、零外部依赖，可离线） |
 | GET  | `/health` | 健康检查 |
-| GET  | `/api/examples` | 内置 6 个可编辑示例 |
-| POST | `/api/validate-snapshot` | 仅校验快照，返回节点数与告警 |
-| POST | `/api/diagnose` | 入参 `{ "snapshot": {...}, "request": {...} }`，返回完整诊断 |
+| GET  | `/api/limits` | 上传大小与 MIME 部分上限 |
+| GET  | `/api/samples` | 内置无害样例清单 |
+| POST | `/api/preview` | multipart 表单字段 `file`；成功返回 `preview_id/preview_url/stats`，失败 4xx 且不产生预览 |
+| GET  | `/preview/{id}` | 隔离预览文档（严格 CSP） |
+| GET  | `/preview/{id}/img/{key}` | 重编码图片或占位图（严格 CSP、nosniff） |
 
-## 五、测试
+## 五、内置样例
+
+样例由 `tools/generate_samples.py` 生成（Pillow 构造，全部无害），随仓库分发于
+`app/static/samples/`，可在首页直接载入：
+
+- `sample1-malicious-tags.eml`：内嵌 PNG/JPEG（cid 引用）、外部跟踪像素、`data:` 图、
+  缺失 cid、`script/on*/style/form/iframe/object/meta 跳转/noscript`、钓鱼链接、表格；
+- `sample2-cid-collision.eml`：与样例 1 使用**相同 cid 但图片内容不同**（验证不串图），
+  另含一份字节损坏的 PNG（验证解码失败回退占位）与缺失 cid。
+
+重新生成：
+
+```bash
+python3 tools/generate_samples.py
+```
+
+## 六、测试
 
 ```bash
 python3 -m pytest tests/ -q
 ```
 
-覆盖：逐级 search 与 EACCES 优先级、mode/ACL 各分支、mask 约束、命中后不退回 other、
-组权限并集、相对/绝对软链接、物理 `..`、第 40/41 次链接边界、非普通文件与 ENOTDIR、
-快照/请求校验定位，以及全部内置示例的端到端诊断。
+覆盖（90+ 用例）：MIME 结构/编码/重复 cid/嵌套拒绝、HTML 白名单与各类 XSS 变异载荷、
+图片解码重编码/格式伪装/解压炸弹/polyglot 尾部剥离、预览 TTL/LRU/cid 隔离、
+API 安全响应头、错误不产生预览、两份样例的端到端渲染与隔离。
 
-## 六、目录结构
+## 七、目录结构
 
 ```
 app/
-  engine.py          # 快照校验 + mode/ACL 权限判定
-  resolver.py        # namei 风格路径解析（软链接、物理 ..、40 次限制）
-  main.py            # FastAPI 路由
+  eml_parser.py     # 受限 .eml 解析与结构校验
+  images.py         # Pillow 解码重编码、像素上限、占位图
+  sanitizer.py      # 白名单 HTML 清理（默认拒绝）
+  storage.py        # 内存预览存储、TTL/LRU、cid 作用域隔离
+  main.py           # FastAPI 路由与安全响应头
   static/
-    index.html       # 离线单页诊断台
-    examples.json    # 6 个可编辑示例
-tests/               # pytest 测试
+    index.html      # 上传页（沙箱 iframe 嵌入预览）
+    samples/*.eml   # 两份无害样例
+tools/
+  generate_samples.py
+tests/              # pytest 测试套件
 Dockerfile, docker-compose.yml, requirements.txt, run.sh
 ```
